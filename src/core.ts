@@ -1,36 +1,46 @@
-// For more information, see https://crawlee.dev/
 import { Configuration, PlaywrightCrawler, downloadListOfUrls } from "crawlee";
-import { readFile, writeFile } from "fs/promises";
 import { glob } from "glob";
 import { Config, configSchema } from "./config.js";
 import { Page } from "playwright";
 import { isWithinTokenLimit } from "gpt-tokenizer";
-import { PathLike } from "fs";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import dotenv from "dotenv";
+import { readFile } from "fs/promises";
+
+dotenv.config();
+
+// Initialize S3 client
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
 
 let pageCounter = 0;
 let crawler: PlaywrightCrawler;
 
-export function getPageHtml(page: Page, selector = "body") {
+// Function to extract page HTML
+export function getPageHtml(page: Page, selector = ".article-content") {
   return page.evaluate((selector) => {
-    // Check if the selector is an XPath
+    let el: HTMLElement | null = null;
+
     if (selector.startsWith("/")) {
       const elements = document.evaluate(
         selector,
         document,
         null,
         XPathResult.ANY_TYPE,
-        null,
+        null
       );
-      let result = elements.iterateNext();
-      return result ? result.textContent || "" : "";
+      el = elements.iterateNext() as HTMLElement | null;
     } else {
-      // Handle as a CSS selector
-      const el = document.querySelector(selector) as HTMLElement | null;
-      return el?.innerText || "";
+      el = document.querySelector(selector);
+      if (!el) {
+        el = document.querySelector("[xpath]");
+      }
     }
+
+    return el?.innerText || "";
   }, selector);
 }
 
+// Function to wait for XPath
 export async function waitForXPath(page: Page, xpath: string, timeout: number) {
   await page.waitForFunction(
     (xpath) => {
@@ -39,126 +49,110 @@ export async function waitForXPath(page: Page, xpath: string, timeout: number) {
         document,
         null,
         XPathResult.ANY_TYPE,
-        null,
+        null
       );
       return elements.iterateNext() !== null;
     },
     xpath,
-    { timeout },
+    { timeout }
   );
 }
 
+// Crawl function
 export async function crawl(config: Config) {
   configSchema.parse(config);
 
   if (process.env.NO_CRAWL !== "true") {
-    // PlaywrightCrawler crawls the web using a headless
-    // browser controlled by the Playwright library.
-    crawler = new PlaywrightCrawler(
-      {
-        // Use the requestHandler to process each of the crawled pages.
-        async requestHandler({ request, page, enqueueLinks, log, pushData }) {
-          const title = await page.title();
-          pageCounter++;
-          log.info(
-            `Crawling: Page ${pageCounter} / ${config.maxPagesToCrawl} - URL: ${request.loadedUrl}...`,
-          );
+    crawler = new PlaywrightCrawler({
+      async requestHandler({ request, page, enqueueLinks, log, pushData }) {
+        const title = await page.title();
+        pageCounter++;
+        log.info(
+          `Crawling: Page ${pageCounter} / ${config.maxPagesToCrawl} - URL: ${request.loadedUrl}...`
+        );
 
-          // Use custom handling for XPath selector
-          if (config.selector) {
-            if (config.selector.startsWith("/")) {
-              await waitForXPath(
-                page,
-                config.selector,
-                config.waitForSelectorTimeout ?? 1000,
-              );
-            } else {
+        if (config.selector) {
+          if (config.selector.startsWith("/")) {
+            await waitForXPath(
+              page,
+              config.selector,
+              config.waitForSelectorTimeout ?? 25000
+            );
+          } else {
+            try {
               await page.waitForSelector(config.selector, {
-                timeout: config.waitForSelectorTimeout ?? 1000,
+                state: "visible",
+                timeout: config.waitForSelectorTimeout ?? 25000
               });
-            }
-          }
-
-          const html = await getPageHtml(page, config.selector);
-
-          // Save results as JSON to ./storage/datasets/default
-          await pushData({ title, url: request.loadedUrl, html });
-
-          if (config.onVisitPage) {
-            await config.onVisitPage({ page, pushData });
-          }
-
-          // Extract links from the current page
-          // and add them to the crawling queue.
-          await enqueueLinks({
-            globs:
-              typeof config.match === "string" ? [config.match] : config.match,
-            exclude:
-              typeof config.exclude === "string"
-                ? [config.exclude]
-                : config.exclude ?? [],
-          });
-        },
-        // Comment this option to scrape the full website.
-        maxRequestsPerCrawl: config.maxPagesToCrawl,
-        // Uncomment this option to see the browser window.
-        // headless: false,
-        preNavigationHooks: [
-          // Abort requests for certain resource types
-          async ({ request, page, log }) => {
-            // If there are no resource exclusions, return
-            const RESOURCE_EXCLUSTIONS = config.resourceExclusions ?? [];
-            if (RESOURCE_EXCLUSTIONS.length === 0) {
+            } catch (error) {
+              log.info(`Failed to find selector ${config.selector} on ${request.loadedUrl}`);
               return;
             }
-            if (config.cookie) {
-              const cookies = (
-                Array.isArray(config.cookie) ? config.cookie : [config.cookie]
-              ).map((cookie) => {
-                return {
-                  name: cookie.name,
-                  value: cookie.value,
-                  url: request.loadedUrl,
-                };
-              });
-              await page.context().addCookies(cookies);
-            }
-            await page.route(
-              `**\/*.{${RESOURCE_EXCLUSTIONS.join()}}`,
-              (route) => route.abort("aborted"),
-            );
-            log.info(
-              `Aborting requests for as this is a resource excluded route`,
-            );
-          },
-        ],
+          }
+        }
+
+        const html = await getPageHtml(page, config.selector);
+
+        if (!html) {
+          log.info(`No content found for selector ${config.selector} on ${request.loadedUrl}`);
+          return;
+        }
+
+        await pushData({ title, url: request.loadedUrl, html });
+
+        if (config.onVisitPage) {
+          await config.onVisitPage({ page, pushData });
+        }
+
+        await enqueueLinks({
+          globs: typeof config.match === "string" ? [config.match] : config.match,
+          exclude: typeof config.exclude === "string" ? [config.exclude] : config.exclude ?? []
+        });
       },
-      new Configuration({
-        purgeOnStart: true,
-      }),
-    );
+      maxRequestsPerCrawl: config.maxPagesToCrawl,
+      preNavigationHooks: [
+        async ({ request, page, log }) => {
+          const RESOURCE_EXCLUSIONS = config.resourceExclusions ?? [];
+          if (RESOURCE_EXCLUSIONS.length === 0) {
+            return;
+          }
+          if (config.cookie) {
+            const cookies = (
+              Array.isArray(config.cookie) ? config.cookie : [config.cookie]
+            ).map((cookie) => {
+              return {
+                name: cookie.name,
+                value: cookie.value,
+                url: request.loadedUrl
+              };
+            });
+            await page.context().addCookies(cookies);
+          }
+          await page.route(
+            `**/*.{${RESOURCE_EXCLUSIONS.join()}}`,
+            (route) => route.abort("aborted")
+          );
+          log.info(`Aborting requests for as this is a resource excluded route`);
+        }
+      ]
+    });
 
     const isUrlASitemap = /sitemap.*\.xml$/.test(config.url);
 
     if (isUrlASitemap) {
       const listOfUrls = await downloadListOfUrls({ url: config.url });
-
-      // Add the initial URL to the crawling queue.
       await crawler.addRequests(listOfUrls);
-
-      // Run the crawler
       await crawler.run();
     } else {
-      // Add first URL to the queue and start the crawl.
       await crawler.run([config.url]);
     }
   }
 }
 
+// Write function with S3 integration
 export async function write(config: Config) {
-  let nextFileNameString: PathLike = "";
   const jsonFiles = await glob("storage/datasets/default/*.json", {
-    absolute: true,
+    absolute: true
   });
 
   console.log(`Found ${jsonFiles.length} files to combine...`);
@@ -173,18 +167,35 @@ export async function write(config: Config) {
   const getStringByteSize = (str: string): number =>
     Buffer.byteLength(str, "utf-8");
 
-  const nextFileName = (): string =>
+  const getS3Key = (): string =>
     `${config.outputFileName.replace(/\.json$/, "")}-${fileCounter}.json`;
 
+  const uploadToS3 = async (key: string, content: string) => {
+    const bucketName = process.env.S3_BUCKET_NAME;
+    if (!bucketName) {
+      throw new Error("S3_BUCKET_NAME is not defined in the environment variables.");
+    }
+
+    const command = new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: content,
+      ContentType: "application/json"
+    });
+
+    try {
+      await s3Client.send(command);
+      console.log(`Uploaded ${key} to S3 bucket ${bucketName}`);
+    } catch (error) {
+      console.error(`Failed to upload ${key}:`, error);
+      throw error;
+    }
+  };
+
   const writeBatchToFile = async (): Promise<void> => {
-    nextFileNameString = nextFileName();
-    await writeFile(
-      nextFileNameString,
-      JSON.stringify(currentResults, null, 2),
-    );
-    console.log(
-      `Wrote ${currentResults.length} items to ${nextFileNameString}`,
-    );
+    const key = getS3Key();
+    const content = JSON.stringify(currentResults, null, 2);
+    await uploadToS3(key, content);
     currentResults = [];
     currentSize = 0;
     fileCounter++;
@@ -193,21 +204,19 @@ export async function write(config: Config) {
   let estimatedTokens: number = 0;
 
   const addContentOrSplit = async (
-    data: Record<string, any>,
+    data: Record<string, any>
   ): Promise<void> => {
     const contentString: string = JSON.stringify(data);
     const tokenCount: number | false = isWithinTokenLimit(
       contentString,
-      config.maxTokens || Infinity,
+      config.maxTokens || Infinity
     );
 
     if (typeof tokenCount === "number") {
       if (estimatedTokens + tokenCount > config.maxTokens!) {
-        // Only write the batch if it's not empty (something to write)
         if (currentResults.length > 0) {
           await writeBatchToFile();
         }
-        // Since the addition of a single item exceeded the token limit, halve it.
         estimatedTokens = Math.floor(tokenCount / 2);
         currentResults.push(data);
       } else {
@@ -222,21 +231,20 @@ export async function write(config: Config) {
     }
   };
 
-  // Iterate over each JSON file and process its contents.
   for (const file of jsonFiles) {
     const fileContent = await readFile(file, "utf-8");
     const data: Record<string, any> = JSON.parse(fileContent);
     await addContentOrSplit(data);
   }
 
-  // Check if any remaining data needs to be written to a file.
   if (currentResults.length > 0) {
     await writeBatchToFile();
   }
 
-  return nextFileNameString;
+  return "Upload complete.";
 }
 
+// GPTCrawlerCore class
 class GPTCrawlerCore {
   config: Config;
 
@@ -248,15 +256,8 @@ class GPTCrawlerCore {
     await crawl(this.config);
   }
 
-  async write(): Promise<PathLike> {
-    // we need to wait for the file path as the path can change
-    return new Promise((resolve, reject) => {
-      write(this.config)
-        .then((outputFilePath) => {
-          resolve(outputFilePath);
-        })
-        .catch(reject);
-    });
+  async write(): Promise<string> {
+    return write(this.config);
   }
 }
 
